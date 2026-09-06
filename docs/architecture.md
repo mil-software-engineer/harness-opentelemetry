@@ -19,12 +19,12 @@ Arrows represent data flow, punctuated lines represent request/response channels
 
 ### 2.2 Component Responsibilities
 
-| Component         | Responsibility                                                                                         |
- |------------------|--------------------------------------------------------------------------------------------------------|
- | Otel Collector | Receive OTLP logs, handle batching, and forward to transformer. No log-to-metric conversion.
- | Transformer    | Parse log records, extract token fields, create Prometheus metrics, and expose them.
- | Prometheus    | Scrape metrics from transformer, store time-series (blocks), and serve queries.
- | Grafana        | Query Prometheus through DataSource, render dashboards, and provide UI.
+ | Component         | Responsibility                                                                                         |
+ |-------------------|--------------------------------------------------------------------------------------------------------|
+ | Otel Collector    | Receive OTLP logs, handle batching, and forward to transformer. No log-to-metric conversion.           |
+ | Transformer       | Parse log records, extract token fields, create Prometheus metrics, and expose them.                   |
+ | Prometheus        | Scrape metrics from transformer, store time-series (blocks), and serve queries.                        |
+ | Grafana           | Query Prometheus through DataSource, render dashboards, and provide UI.                                |
 
 ## 3. Design Decisions
 
