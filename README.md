@@ -1,121 +1,134 @@
-# Telemetry Export for DeepSeek Harness - Otel + Prometheus + Grafana
+# DeepSeek Harness Telemetry → Local Grafana + Prometheus
 
-Deploy a local observability stack to capture DSH token telemetry, convert it to Prometheus metrics, and visualise it in Grafana.
+A fully **local** observability stack that captures DeepSeek Harness (DSH)
+session telemetry, converts the OTLP **logs** DSH ships into Prometheus token
+metrics, and visualises them in Grafana — sliced by token type, session, model
+and tool.
 
-## Features
-- Receives OTLP/HTTP logs from DSH.
-- Transforms logs into Prometheus metrics (token counts by type, session, model, tool, day).
-- Preview in Grafana with pre-configured dashboard.
-- All components run locally: no external SaaS.
+No external SaaS is used. The OTel Collector is the only network receiver;
+everything else runs inside Docker Compose.
+
+## Architecture
+
+```
+DSH ──OTLP/HTTP logs──▶ otel-collector:4318 ──OTLP/HTTP JSON──▶ transformer:8000
+                                                                      │ (log→metric)
+Grafana:3000 ◀──PromQL── Prometheus:9090 ◀──scrape /metrics──┘
+```
+
+- `otel-collector` receives DSH's OTLP/HTTP logs on `4318` and forwards them to
+  the transformer over HTTP. The collector cannot mint Prometheus counters out
+  of log bodies, so it forwards with `encoding: json` to the log→metric service.
+- `transformer` is the only component with business logic. It parses each log
+  record, extracts the numeric usage fields, de-duplicates by
+  `(session.id, event.seq)`, and increments a `dsh_tokens_total` counter
+  labelled by `type`, `session_id`, `model`, `tool`. It serves `/metrics` for
+  Prometheus.
+- `prometheus` scrapes the transformer every 10s and stores the counters.
+- `grafana` is pre-provisioned with a Prometheus data source and an auto-imported
+  **DSH Token Usage** dashboard.
+
+> Token usage arrives as **logs**, not metric series. Numeric Prometheus
+> token metrics are produced by the transformer (the log→metric transform), not
+> by the collector.
 
 ## Quick Start
 
 ```bash
-clone this repo && cd into it
-docker-compose up -d
+docker compose up -d --build
+```
 
+### Point DSH at the stack (restart-safe)
+
+```bash
 export DSH_TELEMETRY_MODE=FULL
 export DSH_TELEMETRY_OTLP_URL=http://localhost:4318/v1/logs
-# (start/restart DSH with these env)
+# start / restart DeepSeek Harness so it picks up the environment
 ```
 
-Then open `http://localhost:3000` (admin/admin) and import the dashboard from `configs/grafana/dashboards/dsh-dashboard.json`.
+- `DSH_TELEMETRY_MODE` → `FULL` (live records) or `FEEDBACK_ONLY`.
+- Any non-empty `DSH_TELEMETRY_DISABLED` opts out.
+- The URL host port `4318` maps to the collector's OTLP/HTTP receiver.
 
-## File Registry
+Keep telemetry local: DSH `FULL` mode exports raw record content, so do **not**
+point this URL at an untrusted remote endpoint.
 
-| Path                                  | Purpose                                                         |
- |-----------------------------------|----------------------------------------------------------------------|
- | `docker-compose.yml`            | Orchestrates all containers with volumes and port mapping.            |
- | `configs/otel.yaml`            | Acts as a proxy - forwards logs from 4318 to transformer.           |
- | `configs/prometheus.yml`        | Defines scrape target & interval for Prometheus.                 |
- | `configs/grafana/datasources/`  | Provisions Prometheus data source in Grafana.              |
- | `configs/grafana/dashboards/`   | Pre-defined dashboard JSON for import.                       |
- | `transformer/Dockerfile`       | Builds the Python transformer image.                              |
- | `transformer/app.py`          | Main FastAPI application (receive logs, expose metrics).            |
- | `transformer/requirements.txt`  | Python dependencies (fastapi, uvicorn, prometheus-client, pytest, httx).  |
- | remote README.md            | Overview, quick start, file registry (this file).               |
- | `docs/requirements.md`        | Software Requirements Specification (SRS).                   |
- | `docs/technical-specification.md` | Technical details of components and data flow.            |
- | `docs/operations-guide.md`     | Runbook and troubleshooting for operators.                  |
- | `docs/development-guide.md`   | Guide for developers (build, test, contribution).            |
- | `docs/architecture.md`       | High-level architecture and design decisions.                     |
- | `CHANGELOG.md`                | Version history of this repository.                                    |
- | `.tests/`                    | Test directory with pytest tests.                                      |
- | `.coveragerc`               | Configuration for code coverage reporting.                            |
-
-## How It Works
-
-DSH emits logs via OTLP/HTTP to `otel-collector`:4318`. The collector forwards them to the transformer on 4319. The transformer extracts token fields (`decodeTokens`, `cacheReadTokens`, ...) and increments a Prometheus counter `dsh_tokens_total` with labelsets. Prometheus scrapes this counter every 10s, and Grafana queries it for dashboards.
-
-The transformer is necessary because the Otel Collector lasks a built-in log-to-metric converter.
-
-## Prune Token Fields
-
-| Field                | Prometheus Type  |
- |------------------|---------------------|
- | `uncachedInputTokens` | `input`            |
- | `cacheReadTokens`   | `cache_read`       |
- | `cacheWriteTokens`   | `cache_write`      |
- | `outputTokens`      | `output`            |
- | `decodeTokens`       | `decode`             |
-
-## Updating / Rebuilding
-
-If you change the transformer code or configs, rebuild and restart the stack:
+### Verify the pipeline
 
 ```bash
-# Stop the current containers
-docker-compose down
+# Collector is up and receiving on the OTLP/HTTP port:
+docker compose ps
 
-# Rebuild the transformer image (if changes were in transformer/)
-docker-compose build transformer
+# Token series are exposed by the transformer:
+curl http://localhost:8002/metrics | grep ^dsh_tokens_total
 
-# Start everything again
-docker-compose up -d
+# Prometheus has scraped them:
+open http://localhost:9090   # query: dsh_tokens_total
+
+# Grafana dashboard:
+open http://localhost:3000   # admin / admin  → "DSH Token Usage"
 ```
 
-Too verify that the transformer is exposing metrics on the correct port:
+## Services & Ports
+
+| Service         | Port (host) | Purpose                                   |
+|-----------------|-------------|-------------------------------------------|
+| otel-collector  | 4318        | OTLP/HTTP logs receiver (DSH target)      |
+| transformer     | 8002        | Metrics inspection (`/metrics`)           |
+| prometheus      | 9090        | Scrape + PromQL                           |
+| grafana         | 3000        | Dashboards (admin/admin)                  |
+
+## File Layout
+
+| Path                                                 | Purpose                                       |
+|------------------------------------------------------|-----------------------------------------------|
+| `docker-compose.yml`                                 | Orchestration, volumes, health/restart policy |
+| `configs/otel.yaml`                                  | Collector: receive OTLP, forward JSON to transformer |
+| `configs/prometheus.yml`                             | Scrape target (`transformer:8000`)            |
+| `configs/grafana/datasources/prometheus.yaml`        | Provisioned Prometheus data source            |
+| `configs/grafana/dashboards/dashboards.yaml`         | Dashboard auto-provisioning provider          |
+| `configs/grafana/dashboards/dsh-dashboard.json`      | "DSH Token Usage" dashboard                   |
+| `transformer/Dockerfile`                             | Transformer image (non-root)                  |
+| `transformer/app.py`                                 | OTLP logs → Prometheus counter transformer    |
+| `transformer/requirements.txt`                       | Pinned runtime dependencies                   |
+| `transformer/requirements-dev.txt`                   | Pinned test dependencies                      |
+| `tests/`                                             | Transformer test suite                        |
+
+## Token fields mapped to `dsh_tokens_total`
+
+| DSH field            | `type` label   |
+|----------------------|----------------|
+| `uncachedInputTokens`| `input`        |
+| `cacheReadTokens`    | `cache_read`   |
+| `cacheWriteTokens`   | `cache_write`  |
+| `outputTokens`       | `output`       |
+| `decodeTokens`       | `decode`       |
+
+Fields are matched by **leaf key name**, so they are found whether DSH records
+them flat or nested. Zero/negative values are ignored; the counter is only ever
+incremented by positive counts.
+
+## Development
+
+Run the test suite:
 
 ```bash
-curl http://localhost:8002/metrics
+python3 -m venv .venv && .venv/bin/pip install -r transformer/requirements-dev.txt
+.venv/bin/python -m pytest tests/
 ```
 
-## Testing
+The tests cover field extraction (flat, nested, proto-JSON `AnyValue`), label
+resolution from OTLP `repeated KeyValue` attributes, API behaviour, error
+handling, de-duplication and per-session metric isolation.
 
-
-To run the test suite for the transformer, install the development dependencies and execute pytest:
+Rebuild after changing the transformer or configs:
 
 ```bash
-# Install test dependencies (already in transformer/requirements.txt)
-pip install -r transformer/requirements.txt
-
-# Run tests with coverage
-pytest tests/ -v --cov=transformer --cove-report=term
+docker compose up -d --build
 ```
-
-To generate an HTML coverage report:
-
-```bash
-pytest tests/ --cov=transformer --cove-report=html
-```
-
-The test suite covers:
-- Extraction of token fields from valid and malformed log records.
-- Handling of missing, zero, or negative token values.
-- Injestion endpoint (`POST /v1/logs`).
-- Metrics exposure endpoint (`GET /metrics`).
-- Error handling for invalid JSON in body.
-
-## Monitoring
-
-- Prometheus UI: `http://localhost:9090`
-- Grafana UI: `http://localhost:3000` (login: admin/admin)
-- Transformer metrics: `curl http://localhost:8002/metrics`
 
 ## Requirements
 
-- Docker <span>20.10&#x21;</span>, Docker Compose <span>2.20&#x21;</span>
-- DSH <span>v1.0.0&#x21;</span> (with the telemetry module enabled)
-
-## License
-MIT License. See `LICENSE` file.
+- Docker Engine 20.10+ and Docker Compose v2
+- DeepSeek Harness with the `@deepseek-ai/dsh-session-telemetry-otel` module
+  mounted (env knobs above)

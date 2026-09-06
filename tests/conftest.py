@@ -1,24 +1,21 @@
+"""Shared fixtures for the transformer test-suite."""
+
+import sys
+from pathlib import Path
+
 import pytest
-import fastapi.testing
+from fastapi.testclient import TestClient
 
-from prometheus_client import REGISTRY
-
-
-@pytest.fixture
-def clear_registry():
-    """Reset the registry before each test."""
-    # Remove all collectors except the default ones
-    collectors = list(REGISTRY._names_to_collectors.keys())
-    for name in collectors:
-        if name != 'prometheus_info':
-            DEGISTRY.unregister(REGISTRY._names_to_collectors[name])
-    REGISTRY._names_to_collectors.clear()
-    REGISTRY._collectors = []
-    # Re-register default collectors if needed
-    pytest.fixture()
+# Make ``transformer`` importable when pytest runs from the repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 @pytest.fixture
-def client():
+def client() -> TestClient:
+    """A TestClient bound to the application under test."""
     from transformer.app import app
-    return fastapi.testing.TestClient(app)
+
+    with TestClient(app) as test_client:
+        yield test_client

@@ -1,8 +1,20 @@
+# Prometheus configuration.
+#
+# The transformer is the log->metric generator: it converts DSH OTLP logs into
+# the `dsh_tokens_total` counter and exposes them on :8000/metrics. This is the
+# only scrape target the local pipeline needs.
 global:
   scrape_interval: 10s
   evaluation_interval: 10s
+  external_labels:
+    source: dsh-local
 
 scrape_configs:
-  - job_name: 'transformer'
+  - job_name: "transformer"
+    metrics_path: /metrics
+    scrape_interval: 10s
+    scrape_timeout: 5s
     static_configs:
-      - targets: ['transformer:8000']
+      - targets: ["transformer:8000"]
+        labels:
+          component: dsh-telemetry-transformer

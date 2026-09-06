@@ -1,89 +1,120 @@
-# Requirements Specification (SRS) for DSH Telemetry Export
+# Requirements Specification (SRS) — DSH Telemetry Export
 
 ## 1. Introduction
-This document describes the functional and non-functional requirements for the system that captures DeepSeek Harness (DSH) session telemetry, converts it into Prometheus-friendly metrics, and presents it in Grafana dashboards.
 
-## 2. Project Objective
-To enable developers and system administrators to monitor token usage and costs of DSH sessions in real time, by deploying a local, self-contained observability stack.
+Functional and non-functional requirements for the system that captures
+DeepSeek Harness (DSH) session telemetry, converts it into Prometheus-friendly
+token metrics, and presents it in Grafana.
+
+## 2. Objective
+
+Let developers/administrators monitor DSH token usage and costs per session,
+per model and per tool in real time, using a local, self-contained observability
+stack (no external SaaS).
 
 ## 3. Scope
-The scope is limited to:
-- Receive OTLP/HTTP logs from DSH (only log records, not metrics).
-- Transform these logs into Prometheus metric series counting tokens by type, session, model, tool, and day.
-- Expose these metrics to Prometheus for scraping.
-- Provide a Grafana dashboard with pre-defined panels for visualization.
-- Ensure all components run locally with no dependency on external SaaS.
 
-## 4. Functional Requirements
+- Receive OTLP/HTTP logs from DSH (log records only — DSH does not emit metric
+  series).
+- Transform logs into the Prometheus counter `dsh_tokens_total`, sliced by
+  token type, session, model and tool, and over time (day bucketing is done in
+  queries, not as a label).
+- Expose the metrics for Prometheus scraping and render them in Grafana.
+- Run entirely locally.
 
-### 4.1 Data Capture
-- The system shall receive OTLP/HTTP log records from DSH on port 4318.
-- It shall support both FULL and FEEDBACK_ONLY modes (though FULL is preferred for complete analysis).
-- The system must handle the following token fields: `uncachedInputTokens`, cacheReadTokens`, cacheWriteTokens`, outputTokens`, decodeTokens`.
-- Deduplication shall be performed based on `session.id + event.seq` (optional).
+## 4. Functional requirements
 
-### 4.2 Data Transformation
-- The system shall extract token counts from the log records body or attributes.
-- It shall create a Prometheus counter metric `dsh_tokens_total` with labels: `type`,  session_id`, `model`, `tool`, `day`.
-- The transformation must be performed by a separate component (transformer) because the Otel Collector cannot directly convert logs to metrics.
+### 4.1 Data capture
 
-### 4.3 Metric Exposure
-- Prometheus shall scrape the metric from the transformer on `transformer:8000`.
-- The scrape interval shall be 10 seconds or configurable.
+- Receive OTLP/HTTP log records on host port `4318` (collector).
+- Support DSH `FULL` and `FEEDBACK_ONLY` modes (default `DISABLED`).
+- Handle token fields `uncachedInputTokens`, `cacheReadTokens`,
+  `cacheWriteTokens`, `outputTokens`, `decodeTokens`, whether they appear flat
+  or nested in the record body/attributes.
+- De-duplicate deliveries on `(session.id, event.seq)` with a bounded store to
+  keep counting idempotent under collector retries.
+
+### 4.2 Data transformation
+
+- Extract positive numeric token counts from record body or attributes.
+- Maintain the Prometheus counter `dsh_tokens_total` with labels `type`,
+  `session_id`, `model`, `tool`.
+- Transformation is performed by the **transformer** component because the OTel
+  Collector cannot convert logs to metrics directly.
+
+### 4.3 Metric exposure
+
+- Prometheus scrapes `transformer:8000/metrics` on a 10s interval.
+- The transformer also exposes `GET /healthz` for the container healthcheck and
+  counters of received/dropped records for observability.
 
 ### 4.4 Visualization
-- Grafana shall be pre-configured with a Prometheus data source.
-- A dashboard shall be provided with at least three panels:
-   - Total tokens over time (graph),
-   - Tokens by session (table),
-   - Daily tokens by model (graph).
 
-### 4.5 Configuration and Operation
-- The system shall be controlled via environment variables for DSH (see Section 6).
-- All components shall be containerized using Docker Compose.
-- Persistent volumes shall be used for Prometheus and Grafana data.
+- Grafana is pre-provisioned with a Prometheus data source.
+- A dashboard (**DSH Token Usage**) is auto-imported and shows: token throughput
+  by type and by model, daily token consumption by type, tokens by session
+  (table) and token throughput by tool.
 
-### 4.6 Monitoring and Logging
-- Each component shall output logs to stdout/container logs.
-- The transformer shall log errors and acknowledge of received records (at debug level).
-- Metrics shall be exposed for monitoring by Prometheus.
+### 4.5 Configuration and operation
 
-## 5. Non-Functional Requirements
+- DSH telemetry is controlled by environment variables (see §6).
+- All components are containerised via Docker Compose.
+- Persistent volumes back Prometheus and Grafana data.
+- Containers restart automatically and the transformer is health-checked.
+
+### 4.6 Monitoring and logging
+
+- Each component logs to stdout (`docker compose logs`).
+- The transformer logs an ingest line per document and exposes its own metrics.
+
+## 5. Non-functional requirements
 
 ### 5.1 Performance
-- The system shall handle a minimum of 100 log records per second without significant latency.
-- The transformer must process records within 200 ms on average.
+- Handle ≥ 100 log records/sec without significant latency.
+- Process documents well under 200 ms on average.
 
 ### 5.2 Security
-- No remote endpoints are used; all traffic is confined to localhost.
-- No tokens or secrets are hard-coded in the code.
-- The transformer does not store or persist any data except in-memory counters.
+- No remote endpoints; traffic is confined to the host.
+- No tokens/secrets are hard-coded; DSH provider keys never appear in session
+  events.
+- The transformer keeps state only in memory (counters + bounded de-dup LRU);
+  nothing is persisted, so nothing is lost beyond metrics on restart.
 
 ### 5.3 Reliability
-- Tasks should be idempotent: if the transformer fails, metrics will be unavailable, but this should not affect!OH operation.
-- Containers should restart automatically (using `restart: unless` policy).
+- Counting is idempotent via de-duplication (replay does not double count).
+- Containers restart automatically (`restart: unless-stopped`); transformer has
+  a `HEALTHCHECK`.
 
 ### 5.4 Maintainability
-- Code should be simple, well-commented, and follow PEP 8 style for Python.
-- Configuration is done via environment variables or clear YAML files.
+- Python code is simple, typed, commented, PEP 8.
+- Configuration lives in YAML/Compose and env vars.
 
-## 6. Environment Variables for DSH Telemetry
-The following env variables must be supported by the system:
+## 6. Environment variables
 
-    | Env Variable               | Description                                                          | Default           |
-    |------------------------------|--------------------------------------------------------------------|-----------------|
-    | DSH_TELEMETRY_MODE        | Either FULL, FEEDBACK_ONLY, or DISABLED                          | DESAEBLE         |
-    | DSH_TELEMETRY_OTLP_URL    | The HTTP target for OTLP/HTTP log push (e.g. `http://localhost:4318/v1/logs`)        | (required in FULL/FEEDBACK_ONLY) |
-    | DSH_TELEMETRY_DISABLED    | Any non-empty value disables telemetry entirely           | (optional)          |
+### 6.1 DSH (set before starting/restarting DSH)
 
-## 7. Acceptance Criteria
-The system is considered acceptable if:
-1. Metrics appear in Prometheus within 10 seconds of first record.
-2. Grafana dashboard displays token data for active sessions.
-3. All containers start without errors and remain healthy (health checks).
+| Variable                  | Description                                                        | Default    |
+|---------------------------|--------------------------------------------------------------------|------------|
+| `DSH_TELEMETRY_MODE`      | `FULL` \| `FEEDBACK_ONLY` \| `DISABLED`                            | `DISABLED` |
+| `DSH_TELEMETRY_OTLP_URL`  | OTLP/HTTP log push URL, e.g. `http://localhost:4318/v1/logs`       | —          |
+| `DSH_TELEMETRY_DISABLED`  | Any non-empty value disables telemetry                             | —          |
 
-## 8. Assumptions and Dependencies
--  DSH is already running with thd `dsh-session-telemetry-otel` module enabled.
--  The local machine has Docker and Docker Compose installed.
--  Ports 4318, 4319, 8000, 9090, 3000 are available.
--  The user has permission to expose env variables for DSH.
+### 6.2 Transformer (Compose/container)
+
+| Variable             | Description                      | Default  |
+|----------------------|----------------------------------|----------|
+| `DSH_DEDUP_CAPACITY` | De-duplication LRU capacity      | `100000` |
+| `APP_HOST`/`APP_PORT`| Uvicorn bind address/port        | `0.0.0.0`/`8000` |
+
+## 7. Acceptance criteria
+
+1. Metrics appear in Prometheus within ~10s of the first forwarded record.
+2. The Grafana dashboard displays token data for active sessions.
+3. All containers start without errors; the transformer reports healthy.
+
+## 8. Assumptions and dependencies
+
+- DSH is running with the `@deepseek-ai/dsh-session-telemetry-otel` module.
+- Docker Engine 20.10+ and Docker Compose v2.
+- Free host ports `4318`, `8002`, `9090`, `3000`.
+- The user can export env vars for DSH.

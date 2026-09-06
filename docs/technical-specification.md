@@ -1,139 +1,147 @@
-# Technical Specification for DSH Telemetry Export
+# Technical Specification — DSH Telemetry Export
 
-## 1. Architecture Overview
-The system consists of four main components orchestrated in a pipeline:
+## 1. Architecture overview
 
-1. DSH - emits OTLP/HTTP logs to `otel-collector:d318/ v1/logs`.
-2. Otel Collector - receives logs and forwards them to the transformer.
-3. Transformer - FastAPI service that converts log records to Prometheus metrics and exposes them.
-4. Prometheus - scrapes the metrics endpoint.
-5. Grafana - queries Prometheus and displays dashboards.
+A pipeline of four containerised components:
 
-## 2. Component Details
+1. **DSH** pushes OTLP/HTTP **logs** (protobuf) to `otel-collector:4318/v1/logs`.
+2. **otel-collector** batches the logs and forwards them as OTLP/HTTP **JSON**
+   to the transformer.
+3. **transformer** converts each log record into the `dsh_tokens_total`
+   Prometheus counter and exposes `/metrics`.
+4. **prometheus** scrapes the transformer; **grafana** queries Prometheus.
 
-### 2.1 Otel Collector
+> DSH ships logs only. The transformer is the log→metric generator; the
+> collector cannot mint counters from log bodies.
+
+## 2. Component details
+
+### 2.1 otel-collector
+
 - Image: `otel/opentelemetry-collector-contrib:latest`
-- Ports:
-   - 4318/TPC - OTLP/HTTP receiver (mapped to host)
-   - not exposed externally (internal only)
 - Config: `configs/otel.yaml`
-   - Receiver: otlp (HTTP)
-   - Processor: batch
-   - Exporter: otlphttp/transformer (to transformer), debug (optional)
-   - Pipeline: logs -> batch -> exporters
+  - Receiver `otlp` (HTTP) on `0.0.0.0:4318` — host port `4318`.
+  - Processors: `memory_limiter`, `batch`.
+  - Exporter `otlp_http/transformer`: `endpoint: http://transformer:8000`,
+    `encoding: json`, `compression: none` (the exporter appends `/v1/logs`).
+  - Exporter `debug` (basic) for local inspection; `health_check` extension.
+  - Pipeline `logs`: `otlp → memory_limiter → batch → otlp_http/transformer, debug`.
 
-### 2.2 Transformer
-- Based on Python 3.11 with FastAPI, runs in a Docker container.
-- Dockerfile: `transformer/Dockerfile`
-- Ports:
-   - 4319/TPC - receives OTLP/HTTP logs from Collector (public)
-   - 8000/TPC - exposes Prometheus metrics (public)
+### 2.2 transformer
+
+- Python 3.11 + FastAPI; `transformer/Dockerfile`, non-root `appuser`.
+- Image built as `dsh-telemetry-transformer:local`; runs on container port `8000`
+  (single port serves both log intake and metrics).
+- Host mapping `8002:8000` is a convenience for manual inspection.
 - Endpoints:
-   - `Post /v1/logs` - accepts OTLP log payloads in JSON format.
-   - `Get /metrics` - returns Prometheus exposition text (plain text).
+  - `GET /` — service info.
+  - `GET /healthz` — health probe (`{"status":"ok"}`).
+  - `POST /v1/logs` — accept an OTLP/HTTP JSON logs document (415 for protobuf,
+    400 for malformed payload).
+  - `GET /metrics` — Prometheus text exposition.
 - Metric definition:
-   - Name: `dsh_tokens_total` (Counter)
-   - Labels: type, session_id, model, tool, day
-   - Description: Total number of tokens consumed, breakdown by type and context.
-   - Token types: `input`, `output`, cache_read`, cache_write`, `decode`.
-- Deduplication: optional, uses an in-memory set of `session.id:event.seq` to avoid double counting.
+  - `dsh_tokens_total{counter}` labelled by `type`, `session_id`, `model`,
+    `tool`. Description: total DSH tokens consumed.
+  - Token types: `input`, `cache_read`, `cache_write`, `output`, `decode`.
+  - Supporting counters: `dsh_log_records_total`, `dsh_log_records_dropped_total`.
+- De-duplication: bounded LRU keyed by `(session.id, event.seq)`; capacity via
+  `DSH_DEDUP_CAPACITY` (default `100000`).
 
-### 2.3 Prometheus
+### 2.3 prometheus
+
 - Image: `prom/prometheus:latest`
-- Port: 9090 (mapped to host)
-- Config: `configs/prometheus.yml`
-   - Scrape interval: 10s
-   - Target: `transformer:8000`
-- Persistent volume: `prometheus_data` (for blocks)
+- Config: `configs/prometheus.yml` — job `transformer`, scrape interval 10s,
+  target `transformer:8000`, `metrics_path: /metrics`.
+- Persistent volume `prometheus_data`. Host port `9090`.
 
-### 2.4 Grafana
-- Image: `grafana/grafana:latest`- Port: 3000 (mapped to host)
-- Provisioning:
-   - Datasource: `http://prometheus:9090` (automatically added)
-   - Dashboard: `provisioned/dsh-dashboard.json` (imported)
-- Persistent volume: `grafana_data`
+### 2.4 grafana
 
-## 3. Data Flow
+- Image: `grafana/grafana:latest`
+- Provisioning (read-only mounts):
+  - Datasource: `configs/grafana/datasources/prometheus.yaml` → `Prometheus`
+    (`uid: prometheus`, default) → `http://prometheus:9090`.
+  - Dashboard provider: `configs/grafana/dashboards/dashboards.yaml` →
+    imports every `*.json` in the folder, including `dsh-dashboard.json`
+    (**DSH Token Usage**, `uid: dsh-token-usage`).
+- Persistent volume `grafana_data`. Host port `3000` (admin/admin).
 
-### 3.1 Log Record structure(OTLP JSON)
-The transformer expects the following fields in each `collector.scopeLogs.logRecords`:
+## 3. Data model
+
+### 3.1 OTLP/HTTP JSON log record (as the collector forwards it)
+
+The collector emits proto-JSON: `attributes` is an OTel `repeated KeyValue`
+array, and `body` is an OTLP `AnyValue` (often a JSON string containing the
+usage fields).
+
 ```json
 {
-  "timeUnixNano": "1699999999999999999",
-  "observedTimeUnixNano": "...",
+  "timeUnixNano": "1757152345123456789",
   "severityNumber": 9,
+  "severityText": "INFO",
   "body": {
-    "uncachedInputTokens": 50,
-    "cacheReadTokens": 100,
-    "cacheWriteTokens": 20,
-    "outputTokens": 150,
-    "decodeTokens": 30
+    "stringValue": "{\"uncachedInputTokens\":123,\"outputTokens\":89}"
   },
-  "attributes": {
-    "session.id": "abc-123",
-    "model": "depseek-chat",
-    "tool": "search",
-    "event.seq": 1
-  }
+  "attributes": [
+    {"key": "session.id", "value": {"stringValue": "abc-123"}},
+    {"key": "event.seq",  "value": {"intValue": "1"}},
+    {"key": "model",      "value": {"stringValue": "deepseek-reasoner"}},
+    {"key": "tool",       "value": {"stringValue": "agent"}}
+  ]
 }
 ```
-- The transformer looks for token fields first in `body` (if it’s a JSON object), then in `attributes`.
-- If `body` is a string, it is parsed as JSON.
 
-### 3.2 Metric Exposure
-Each token field with a positive numeric value triggers an increment to `dsh_tokens_total` with the appropriate labels.
+The transformer also tolerates the plain-map form (`attributes` as an object,
+`body` as a JSON object or raw map). Token fields are matched by **leaf key
+name**, so they are found flat or nested, in `body` or `attributes`; zero and
+negative values are ignored.
 
-Example: a record with `uncachedInputTokens=50` and `session.id=x,y` increments `dsh_tokens_total{type="input", session_id="x-y", ...}` by 50.
+### 3.2 Metric exposure
 
-### 3.3 Sampling and Batching
--  The Collector uses a batch processor (default batch size 1024) to reduce network overhead.
--  The transformer processes each record independently. No additional buffing is applied.
+Each positive numeric token field increments `dsh_tokens_total` with the
+corresponding labels. Example — a record with `outputTokens=89` for session
+`abc-123` on model `deepseek-reasoner` / tool `agent`:
 
-## 4. Configuration Files
+```
+dsh_tokens_total{type="output", session_id="abc-123",
+                 model="deepseek-reasoner", tool="agent"} 89
+```
 
-| File                           | Purpose                                                            |
- |-----------------------------|-----------------------------------------------------------------|
- | docker-compose.yml         | Orchestrates all containers with volumes and port mapping.            |
- | configs/otel.yaml         | Acts as a proxy - forwards logs from 4318 to transformer.           |
- | configs/prometheus.yml     | Defines scrape target & interval for Prometheus.                 |
- | configs/grafana/datasources/ | Provisions Prometheus data source in Grafana.              |
- | configs/grafana/dashboards/  | Pre-defined dashboard json for import.                       |
- | transformer/Dockerfile      | build the Python transformer image.                             |
- | transformer/app.py         | Main FastAPI application with log and metric handlers.           |
- | transformer/requirements.txt  | Contains fastapi, uvicorn, prometheus-client.              |
- | RREADME.md                  | Overview, quick start, and file registry (see below).              |
- | docs/requirements.md     | SRS document (this file).                                          |
- | docs/technical-specification.md | Technical spec (this file).                                  |
- | docs/operations-guide.md    | Runnook and troubleshooting for operators.                  |
- | docs/development-guide.md  | Guide for developers (build, test, contribution).             |
- | CHANGELOG.md               | Version history of this project.                                      |
+### 3.3 Batching
 
-## 5. Performance and Scaling
-* Supported throughput: at least 100 records/second without buffer overrun.
-* Response time of transformer (post /v1/logs): < 200ms for calls with < 500 records.
-* Scrape interval: 10s (configurable, but 10s is recommended).
+The collector uses `memory_limiter` + `batch` to smooth bursts. The transformer
+counts each record independently; the bounded LRU prevents double counting on
+retries.
 
-## 6. Security Considerations
-- All traffic is on localhost. No external access is allowed by default.
-- The transformer does not persist any data; all state is in-memory and lost on restart.
-- PII’ are not stored in any form.
+## 4. Configuration files
 
-## 7. Monitoring and Alerting
-- Health checks are not built in, however, standard Docker healthchecks can be added.
-- Logging is output to stdout; collect via docker logs.
-- Prometheus alerts can be configured if needed.
+| File                                                   | Purpose                                        |
+|--------------------------------------------------------|------------------------------------------------|
+| `docker-compose.yml`                                   | Orchestration, volumes, health/restart policy |
+| `configs/otel.yaml`                                    | Collector config (OTLP receive → JSON forward)|
+| `configs/prometheus.yml`                               | Scrape target and interval                     |
+| `configs/grafana/datasources/prometheus.yaml`          | Provisioned Prometheus data source             |
+| `configs/grafana/dashboards/dashboards.yaml`           | Dashboard auto-provisioning provider           |
+| `configs/grafana/dashboards/dsh-dashboard.json`        | "DSH Token Usage" dashboard                    |
+| `transformer/Dockerfile`                               | Transformer image build                        |
+| `transformer/app.py`                                   | FastAPI log→metric transformer                 |
+| `transformer/requirements.txt`                         | Pinned runtime deps                            |
+| `transformer/requirements-dev.txt`                     | Pinned test deps                               |
+| `tests/`                                               | pytest suite for the transformer               |
+| `docs/*.md`                                            | This documentation set                         |
 
-## 8. Dependencies
+## 5. Ports
 
-### 8.1 Otel Collector image
-- a ``default` version oveland. The contrib version is used for broader compatibility.
+| Host | Container | Service     | Purpose                              |
+|------|-----------|-------------|--------------------------------------|
+| 4318 | 4318      | otel-collector | OTLP/HTTP logs receiver (DSH target) |
+| 8002 | 8000      | transformer  | Manual `/metrics` (log intake also on 8000) |
+| 9090 | 9090      | prometheus   | PromQL / targets UI                  |
+| 3000 | 3000      | grafana      | Dashboard UI (admin/admin)           |
 
-### 8.2 Transformer Python dependencies
-`here-lets keep them in requirements.txt`
-- fastapi ($ latest)
-- uvicorn ($ latest)
-- prometheus-client ($ latest)
+## 6. Security considerations
 
-### 8.3 Other
-- Docker Engine 20.10++
-- Docker Compose 2.20++
+- All traffic stays on the host; the collector/transformer are not exposed
+  beyond `4318`/`8002`/`9090`/`3000`.
+- DSH `FULL` mode exports raw record content — keep it pointed at this local
+  collector only.
+- The transformer persists nothing; all state is in-memory and reset on restart.
