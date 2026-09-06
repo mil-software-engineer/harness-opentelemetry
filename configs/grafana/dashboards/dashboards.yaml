@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning. Any `*.json` in the `options.path` folder is
+# imported as a dashboard. This file lives beside the dashboards it imports.
+apiVersion: 1
+
+providers:
+  - name: "DSH Dashboards"
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 15
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

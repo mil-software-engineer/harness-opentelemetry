@@ -1,3 +1,9 @@
+# OpenTelemetry Collector configuration for the DSH token-telemetry pipeline.
+#
+# DSH ships OTLP/HTTP *logs* only. The Collector receives them on 4318 and
+# forwards them to the transformer (the log->metric generator). It cannot mint
+# Prometheus counters out of log bodies itself, so no `metrics` pipeline scrapes
+# here — Prometheus scrapes the transformer directly (see prometheus.yml).
 receivers:
   otlp:
     protocols:
@@ -5,21 +11,44 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 15
   batch:
     timeout: 1s
     send_batch_size: 1024
 
 exporters:
-  otlphttp/transformer:
-    endpoint: http://transformer:4319/v1/logs
+  # Forwards the log stream to the transformer, which re-emits token usage as a
+  # Prometheus counter. `encoding: json` is essential: the transformer parses
+  # OTLP/HTTP JSON (it is not a protobuf endpoint). The exporter appends
+  # `/v1/logs` to the base `endpoint` automatically.
+  otlp_http/transformer:
+    endpoint: http://transformer:8000
+    encoding: json
+    compression: none
     tls:
       insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 512
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 60s
+
+  # Optional quick-local-inspection sink; remove from the pipeline to silence.
   debug:
     verbosity: basic
 
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
 service:
+  extensions: [health_check]
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlphttp/transformer, debug]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/transformer, debug]

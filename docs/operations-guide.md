@@ -1,85 +1,90 @@
-# Operations Guide for the DSH Telemetry Export
+# Operations Guide — DSH Telemetry Export
 
-## 1. Quick Reference
+## 1. Quick reference
 
-| Operation                                 | Command                                                                |
- |----------------------------------------|------------------------------------------------------------------------------|
- | Start all services                  | `docker-compose up -d`                                                              |
- | Stop all services                  | `docker-compose down` , `docker-compose down -v` (volumes)          |
- | Restart a single service            | `docker-compose restart <service-name>`                                   |
- | View logs of a service            | `docker logs <service-name>`                                                |
- | Check transformer metrics           | `curl http://localhost:8000/metrics`                                            |
- | Check Otel Collector health       | `curl http://localhost:13134/v1/health` (TNL) or curl :4318/v1/health` (HTTP) |
- | Check Prometheus targets           | `curl http://localhost:9090/targets`                                              |
- | Access Grafana UI                 | Open `http://localhost:3000` (login: admin/admin)                        |
- | Reload Grafana datasource         | Restart grafana: `docker-compose restart grafana`                        |
- | Reset persistent volumes            | `docker-compose down -v ; docker-volume rm -f prometheus_data grafana_data`        |
+| Operation               | Command                                                            |
+|-------------------------|--------------------------------------------------------------------|
+| Start the stack         | `docker compose up -d --build`                                     |
+| Stop the stack          | `docker compose down` (add `-v` to drop volumes)                   |
+| Restart a service       | `docker compose restart <service>`                                 |
+| View logs               | `docker compose logs -f <service>`                                 |
+| Container status        | `docker compose ps`                                                |
+| Transformer metrics     | `curl http://localhost:8002/metrics`                               |
+| Prometheus UI           | `http://localhost:9090`                                            |
+| Grafana UI              | `http://localhost:3000` (admin/admin)                              |
+| Re-provision Grafana    | `docker compose restart grafana` (reads datasource/dashboard files)|
+| Reset persistent data   | `docker compose down -v`                                           |
 
-## 2. Deployment Steps (step-by-step)
+## 2. Deployment
 
-1. Clone this repository into your local machine.
-   ``gbash
-   git clone https://github.com/your-repo/telemetry-export.git
-   cd telemetry-export
-   ```
+```bash
+git clone <your-repo> && cd <your-repo>
+docker compose up -d --build
+docker compose ps   # all four services Up; transformer Healthy
+```
 
-2. Ensure Docker and Docker Compose are installed.
-3. Start the stack:
-   ``bash
-   docker-compose up -d
-   ```
-4. Verify that all containers are running:
-   ``bash
-   docker-compose ps
-   ```
-5. Configure DSH to send telemetry to the collector by setting environment variables (see below).
-6. Restart DSH so that the new variables are picked up.
-7. Check that metrics appear in Prometheus by opening `http://localhost:9090`.
-8. In Grafana, add the Prometheus data source (it should be automatically provisioned).
-9. Import the dashboard from `configs/grafana/dashboards/dsh-dashboard.json` or create a new one.
+Host ports required: `4318`, `8002`, `9090`, `3000`.
 
-## 3. Configuring DSH Telemetry
-To enable telemetry from DSH, set the following environment variables before starting DSH (or restart):
+## 3. Configuring DSH telemetry
+
+Before starting (or restarting) DSH:
 
 ```bash
 export DSH_TELEMETRY_MODE=FULL
 export DSH_TELEMETRY_OTLP_URL=http://localhost:4318/v1/logs
+# start / restart DeepSeek Harness so the env is picked up
 ```
 
-To disable telemetry temporarily:
-```bash
-export DSH_TELEMETRY_MODE=DISABLED
-```
+- `FULL` = live records; `FEEDBACK_ONLY` = replay/redact on `feedback/record`.
+- Disable temporarily: `DSH_TELEMETRY_MODE=DISABLED` or set
+  `DSH_TELEMETRY_DISABLED=1`.
 
-Or use `DSH_TELEMETRY_DISABLED=1` to force disable.
+> `FULL` exports raw record content — keep the URL pointed at this local
+> collector (`localhost:4318`), never an untrusted remote endpoint.
 
-## 4. Troubleshooting
+## 4. Verification
 
-### 4.1 No metrics appearing
-* Check DSH logs to confirm it is sending records (set log level to debug).
-* View Otel Collector logs: `docker logs otel-collector` - look for errors or connection refusals.
-* Check transformer logs: `docker logs transformer` - it should print a received message for each batch.
-* Verify that the transformer is exposing metrics: `curl localhost:8000/metrics` should return `mypc_dsh_tokens_total`.
-* Ensure Prometheus is scraping the correct target: `curl localhost:9090/targets` should list `transformer:8000`.
+1. `docker compose ps` — all services `Up`; transformer `(healthy)`.
+2. `curl http://localhost:8002/metrics | grep ^dsh_tokens_total` — a series
+   appears once records arrive.
+3. `http://localhost:9090` → query `dsh_tokens_total`; the `transformer` target
+   should be `UP`.
+4. `http://localhost:3000` → **DSH Token Usage** dashboard is already imported
+   and the Prometheus data source is connected.
 
-### 4.2 Dashboard not populating
-* Check Grafana data source url is `prometheus:9090` (not `localhost`).
-* Verify that the datasource is successfully connected (in Grafana, DataSources > Prometheus > Test).
-* Refresh the dashboard or import it again.
+## 5. Troubleshooting
 
-### 4.3 Container crashes or restarts
-* Increase memory limits in `docker-compose.yml` for the transformer if needed.
-* Use `docker-compose logs <service>` to inspect errors.
-* If the transformer fails, restart it: `docker-compose restart transformer`.
+### 5.1 No metrics appearing
+- Confirm DSH is sending (its log level = debug) and env vars are set.
+- `docker compose logs otel-collector` — the collector must start without config
+  errors and show `debug` exporting (`log records: N`).
+- `docker compose logs transformer` — should print an `ingested OTLP logs
+  document: N observation(s)` line per batch.
+- `curl http://localhost:8002/metrics` should expose `dsh_tokens_total`.
+- `http://localhost:9090/targets` should list job `transformer` → target
+  `transformer:8000` as `UP`.
 
-### 4.4 Persistent data issues
-*If you want to reset all data, run `docker-compose down -v` and then remove the volumes:
-```bash
-docker volume rm -f prometheus_data grafana_data
-```
+### 5.2 Dashboard empty
+- Grafana data source URL must be `http://prometheus:9090` (service name, not
+  `localhost`); test it under Data sources → Prometheus → Save & test.
+- Dashboard values come from `dsh_tokens_total`; if only a single burst was ever
+  sent, rate-based panels can look flat — send records continuously.
 
-## 5. Monitoring and Maintenance
+### 5.3 Container crashes / permission errors
+- Config bind mounts are `:ro`; if a service reports `permission denied`, ensure
+  the host files under `configs/` are world-readable (`chmod -R a+rX configs`),
+  then `docker compose restart`.
+- Inspect: `docker compose logs <service>`; restart: `docker compose restart
+  <service>`.
 
-- Regularly check the size of prometheus blocks (volume). Clean if too large.
-- Update DSH or the transformer image by rebuilding the containers (`docker-compose build` or use new images).
-- Consider using a reverse proxy (e.g. nginx) if you need to expose the dashboard publicly (not recommended).
+### 5.4 Reset
+- Reset metrics/dashboards: `docker compose down -v && docker compose up -d`.
+
+## 6. Monitoring and maintenance
+
+- Watch `dsh_tokens_total` for spend; watch `dsh_log_records_dropped_total` (a
+  positive value means records were skipped as duplicates).
+- Rebuild after changing `transformer/` or configs: `docker compose up -d
+  --build`.
+- Prometheus/Grafana state is on named volumes; back them up if you need the
+  history.

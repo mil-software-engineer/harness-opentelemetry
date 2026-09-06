@@ -13,7 +13,7 @@ Source of truth: `docker-compose.yml`, `transformer/app.py`, `configs/*`; docs m
 - Ambiguous scope or decision: ask once before coding.
 - Before editing: one-line task restatement + affected files.
 - Only what's asked: no tests/docs/extra code unless requested; mirror `tests/` when tests are wanted.
-- Respond with changed file paths + a 2–3 word summary. No boilerplate, rationale, or repeats.
+- Report result as short as possible: bare comma-separated list of changed file paths and, if truly needed, one ≤5-word note. No prose, no summary sentences, no rationale, no restating the task. When nothing changed: reply "No changes.".
 - Never read whole files/logs: grep first, read only matching ranges; cap command output to error tail.
 
 ## Done

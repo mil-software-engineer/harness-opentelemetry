@@ -1,47 +1,72 @@
+# Local observability stack for DeepSeek Harness (DSH) token/usage telemetry.
+#
+# Data flow (all local, no external SaaS):
+#   DSH --OTLP/HTTP logs--> otel-collector:4318 --> transformer:8000/v1/logs
+#   transformer --Prometheus counter--> prometheus:9090 <-- scrape
+#   grafana:3000 queries prometheus:9090
+#
+# The transformer is the only component with logic: DSH ships OTLP *logs*, so it
+# converts them into the `dsh_tokens_total` Prometheus counter that Prometheus
+# scrapes. See configs/otel.yaml and transformer/app.py.
+
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     container_name: otel-collector
-    command: [ "--config=/etc/otel.yaml" ]
-    volumes:
-      - ./configs/otel.yaml:/etc/otel.yaml
-    ports:
-      - "4318:4318"      # OTLP/HTTP receiver (DSH sends logs here)
+    restart: unless-stopped
+    command: ["--config=/etc/otel.yaml"]
     depends_on:
-      - transformer
+      transformer:
+        condition: service_healthy
+    ports:
+      # DSH points DSH_TELEMETRY_OTLP_URL at this host port.
+      - "4318:4318"
+    volumes:
+      - ./configs/otel.yaml:/etc/otel.yaml:ro
 
   transformer:
     build: ./transformer
+    image: dsh-telemetry-transformer:local
     container_name: transformer
-    ports:
-      - "4319:4319"      # OTLP/HTTP receiver (accepts logs from collector)
-      - "8002:8000"      # Prometheus metrics endpoint (host:container)
-    environment:
-      - METRICS_PORT=8000
     restart: unless-stopped
+    expose:
+      # Internal port the collector forwards logs to and Prometheus scrapes.
+      - "8000"
+    ports:
+      # Convenience host mapping for manual inspection:
+      #   curl http://localhost:8002/metrics
+      - "8002:8000"
 
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
-    volumes:
-      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
+    restart: unless-stopped
+    depends_on:
+      transformer:
+        condition: service_healthy
     ports:
       - "9090:9090"
-    depends_on:
-      - transformer
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
-    volumes:
-      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources
-      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      prometheus:
+        condition: service_started
     ports:
       - "3000:3000"
-    depends_on:
-      - prometheus
+    volumes:
+      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
 
 volumes:
   prometheus_data:
