@@ -1,0 +1,11 @@
+[run]
+source = transformer
+omit =
+    */tests/*
+    */__pythach__*
+
+[report]
+exclude_lines = 
+    pragma: no-cover
+    def * : * # no cover
+    pragma: no-cover

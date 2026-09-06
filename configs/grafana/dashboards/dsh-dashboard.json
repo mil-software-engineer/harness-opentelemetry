@@ -1,0 +1,39 @@
+{
+  "title": "DSH Token Usage",
+  "tags": ["dsh"],
+  "timezone": "browser",
+  "schemaVersion": 16,
+  "version": 0,
+  "panels": [
+    {
+      "title": "Total tokens over time",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "sum(rate(dsh_tokens_total[5m])) by (type)",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "title": "Tokens per session (last hour)",
+      "type": "table",
+      "targets": [
+        {
+          "expr": "sum(dsh_tokens_total) by (session_id)",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "title": "Daily tokens by model",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "sum(increase(dsh_tokens_total[1d])) by (model, type)",
+          "legendFormat": "{{model}} ({{type}})"
+        }
+      ]
+    }
+  ]
+}
