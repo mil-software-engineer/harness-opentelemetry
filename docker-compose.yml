@@ -1,0 +1,48 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: [ "--config=/etc/otel.yaml" ]
+    volumes:
+      - ./configs/otel.yaml:/etc/otel.yaml
+    ports:
+      - "4318:4318"      # OTLP/HTTP receiver (DSH sends logs here)
+    depends_on:
+      - transformer
+
+  transformer:
+    build: ./transformer
+    container_name: transformer
+    ports:
+      - "4319:4319"      # OTLP/HTTP receiver (accepts logs from collector)
+      - "8002:8000"      # Prometheus metrics endpoint (host:container)
+    environment:
+      - METRICS_PORT=8000
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - transformer
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
