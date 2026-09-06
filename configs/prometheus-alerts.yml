@@ -1,0 +1,59 @@
+# Basic Prometheus alerting rules for the DSH transformer cost pipeline.
+#
+# No external notifier is configured anywhere (no alertmanager in compose): these
+# rules are evaluated by Prometheus and surfaced via /api/v1/rules + the Prom UI.
+# All alerts are severity=warning.
+
+groups:
+  - name: dsh-cost
+    rules:
+      # A single session spending more than $1 in the last hour usually signals
+      # an unbounded loop / runaway agent task worth investigating.
+      - alert: DSHHighSessionCost
+        expr: |
+          sum by (session_id, model) (
+            increase(dsh_cost_usd_total[1h])
+          ) > 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session {{ $labels.session_id }} cost over $1 in the last hour"
+          description: >-
+            Session {{ $labels.session_id }} ({{ $labels.model }}) accrued more
+            than $1 of usage in the last hour.
+
+      # Routes we cannot map to a pricing model are never billed, so growth here
+      # means telemetry is drifting from the known route set and costs are hidden.
+      - alert: DSHUnknownModelGrowing
+        expr: |
+          increase(dsh_cost_unknown_model_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unknown DSH model route observed"
+          description: >-
+            The transformer saw at least one log record whose model route has no
+            matching pricing row in the last 15 minutes; its cost was not billed.
+
+      # Low share of cache-hit vs cache-miss+write input over 5m suggests prompt
+      # prefixes are not being reused across runs (context is being split/re-sent).
+      # Guarded with `... > 0` so models with no input traffic cannot divide by 0.
+      - alert: DSHLowCacheHitRate
+        expr: |
+          (
+            sum by (model) (rate(dsh_tokens_total{type="cache_read"}[5m]))
+            /
+            sum by (model) (rate(dsh_tokens_total{type=~"input|cache_write"}[5m]))
+          ) < 0.2
+          and
+          sum by (model) (rate(dsh_tokens_total{type=~"input|cache_write"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low cache-hit rate for {{ $labels.model }}"
+          description: >-
+            Cache-hit ratio for model {{ $labels.model }} stayed below 0.2 for the
+            last 15 minutes; prompt prefixes are probably not being reused.

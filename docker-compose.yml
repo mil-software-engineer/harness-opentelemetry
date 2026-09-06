@@ -29,6 +29,9 @@ services:
     image: dsh-telemetry-transformer:local
     container_name: transformer
     restart: unless-stopped
+    environment:
+      # Edge-cost pricing table mounted below (see configs/pricing.json).
+      PRICING_FILE: /app/pricing.json
     expose:
       # Internal port the collector forwards logs to and Prometheus scrapes.
       - "8000"
@@ -36,6 +39,8 @@ services:
       # Convenience host mapping for manual inspection:
       #   curl http://localhost:8002/metrics
       - "8002:8000"
+    volumes:
+      - ./configs/pricing.json:/app/pricing.json:ro
 
   prometheus:
     image: prom/prometheus:latest
@@ -48,7 +53,21 @@ services:
       - "9090:9090"
     volumes:
       - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus-alerts.yml:/etc/prometheus/prometheus-alerts.yml:ro
       - prometheus_data:/prometheus
+
+  # Local log store: the otel-collector re-exports the DSH OTLP log stream here
+  # (parallel to the transformer) so Grafana can query raw logs / session context.
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./configs/loki.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
 
   grafana:
     image: grafana/grafana:latest
@@ -71,3 +90,4 @@ services:
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:

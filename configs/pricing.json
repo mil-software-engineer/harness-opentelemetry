@@ -1,0 +1,28 @@
+{
+  "pricing_version": "v1",
+  "default_effort": "low",
+  "peak_windows_utc": [[1, 4], [6, 10]],
+  "peak_weekdays": [1, 2, 3, 4, 5],
+  "route_map": {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-pro"
+  },
+  "rows": [
+    { "model": "deepseek-v4-flash", "slot": "input_miss",   "period": "off_peak", "price_per_million": 0.220,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "input_miss",   "period": "peak",     "price_per_million": 0.440,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "input_hit",    "period": "off_peak", "price_per_million": 0.007,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "input_hit",    "period": "peak",     "price_per_million": 0.014,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "input_write",  "period": "off_peak", "price_per_million": 0.220,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "input_write",  "period": "peak",     "price_per_million": 0.440,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "output",       "period": "off_peak", "price_per_million": 0.660,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-flash", "slot": "output",       "period": "peak",     "price_per_million": 1.320,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_miss",   "period": "off_peak", "price_per_million": 0.660,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_miss",   "period": "peak",     "price_per_million": 1.320,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_hit",    "period": "off_peak", "price_per_million": 0.022,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_hit",    "period": "peak",     "price_per_million": 0.044,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_write",  "period": "off_peak", "price_per_million": 0.660,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "input_write",  "period": "peak",     "price_per_million": 1.320,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "output",       "period": "off_peak", "price_per_million": 1.980,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" },
+    { "model": "deepseek-v4-pro",   "slot": "output",       "period": "peak",     "price_per_million": 3.960,  "effective_from": "2026-08-16T00:00:00Z", "currency": "USD" }
+  ]
+}

@@ -1,11 +1,21 @@
 """Unit and API tests for the DSH token-telemetry transformer."""
 
 import json
+import os
 import re
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
+import pytest
 from prometheus_client import CONTENT_TYPE_LATEST
+
+# Pin the pricing table the app-under-test loads (its module-level store reads
+# PRICING_FILE on import). Defaulting to the repo seed keeps the deterministic
+# cost fixture below stable without forcing a particular ambient environment.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("PRICING_FILE", str(_REPO_ROOT / "configs" / "pricing.json"))
 
 
 # --------------------------------------------------------------------------- #
@@ -250,3 +260,204 @@ def test_metrics_isolation_across_sessions(client):
     client.post("/v1/logs", json=_otlp_payload(_log_record(session_id=b, seq=1, body={"outputTokens": 20})))
     assert _counter_value(client, token_type="output", session_id=a) == 10.0
     assert _counter_value(client, token_type="output", session_id=b) == 20.0
+
+
+# --------------------------------------------------------------------------- #
+# Edge cost (stage 1)
+# --------------------------------------------------------------------------- #
+
+def _cost_by(client, session_id: str) -> dict:
+    out: dict = {}
+    for labels, value in _fetch_samples(client, "dsh_cost_usd_total"):
+        if labels.get("session_id") == session_id:
+            out[labels["type"]] = out.get(labels["type"], 0.0) + value
+    return out
+
+
+def _savings_for_session(client, session_id: str) -> float:
+    return sum(
+        value for labels, value in _fetch_samples(client, "dsh_cache_savings_usd_total")
+        if labels.get("session_id") == session_id
+    )
+
+
+def _nanos(dt_utc: datetime) -> str:
+    return str(int(dt_utc.timestamp() * 1e9))
+
+
+def _plain_counter_value(client, metric: str) -> float:
+    """Read a single label-less counter (e.g. dsh_cost_unknown_model_total)."""
+    text = client.get("/metrics").text
+    match = re.search(rf"^{re.escape(metric)}\s+([0-9.eE+-]+)\s*$", text, re.M)
+    return float(match.group(1)) if match else 0.0
+
+
+def test_cost_counter_deterministic_fixture(client):
+    """Stage-1 deterministic fixture: Mon 2026-09-07 12:00Z, deepseek-chat.
+
+    uncachedInputTokens=1000, cacheReadTokens=1000, cacheWriteTokens=0,
+    outputTokens=2000, decodeTokens=900 (decode must NOT be billed).
+    off_peak flash prices .22/.007/.66 => cost .001547, savings .000213.
+    """
+    session_id = _session()
+    record = _log_record(
+        session_id=session_id,
+        seq=1,
+        body={
+            "uncachedInputTokens": 1000,
+            "cacheReadTokens": 1000,
+            "cacheWriteTokens": 0,
+            "outputTokens": 2000,
+            "decodeTokens": 900,
+        },
+    )
+    record["timeUnixNano"] = _nanos(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+
+    response = client.post("/v1/logs", json=_otlp_payload(record))
+    assert response.status_code == 200
+
+    by_type = _cost_by(client, session_id)
+    assert by_type["input_miss"] == pytest.approx(0.00022)
+    assert by_type["input_hit"] == pytest.approx(0.000007)
+    assert by_type["output"] == pytest.approx(0.00132)
+    # decode is never billed.
+    assert "decode" not in by_type
+    assert sum(by_type.values()) == pytest.approx(0.001547)
+
+    # Labels on the emitted series.
+    matched = [
+        labels for labels, _ in _fetch_samples(client, "dsh_cost_usd_total")
+        if labels.get("session_id") == session_id and labels.get("type") == "input_miss"
+    ]
+    assert matched
+    assert matched[0]["model"] == "deepseek-v4-flash"
+    assert matched[0]["tool"] == "run"
+    assert matched[0]["effort"] == "low"
+    assert matched[0]["period"] == "off_peak"
+    assert matched[0]["price_version"] == "v1"
+
+    assert _savings_for_session(client, session_id) == pytest.approx(0.000213)
+
+
+def test_cost_counter_peak_period_uses_peak_price(client):
+    """Tuesday 2026-09-08 08:00Z is peak => flash output billed at 1.32/1M."""
+    session_id = _session()
+    record = _log_record(
+        session_id=session_id,
+        seq=1,
+        body={"outputTokens": 1_000_000},
+    )
+    record["timeUnixNano"] = _nanos(datetime(2026, 9, 8, 8, 0, tzinfo=timezone.utc))
+    client.post("/v1/logs", json=_otlp_payload(record))
+
+    by_type = _cost_by(client, session_id)
+    assert by_type["output"] == pytest.approx(1.32)
+    matched = [
+        labels for labels, _ in _fetch_samples(client, "dsh_cost_usd_total")
+        if labels.get("session_id") == session_id and labels.get("type") == "output"
+    ]
+    assert matched
+    assert matched[0]["period"] == "peak"
+    assert matched[0]["effort"] == "low"
+    assert matched[0]["model"] == "deepseek-v4-flash"
+    assert matched[0]["price_version"] == "v1"
+
+
+def test_cost_unknown_model_increments_and_not_billed(client):
+    before = _plain_counter_value(client, "dsh_cost_unknown_model_total")
+    session_id = _session()
+    record = _log_record(
+        session_id=session_id,
+        seq=1,
+        model="not-a-known-route",
+        body={"outputTokens": 10},
+    )
+    record["timeUnixNano"] = _nanos(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    assert client.post("/v1/logs", json=_otlp_payload(record)).status_code == 200
+
+    after = _plain_counter_value(client, "dsh_cost_unknown_model_total")
+    assert after == before + 1
+    # Unknown model is unbilled -> no cost series for this session.
+    assert _cost_by(client, session_id) == {}
+
+
+def test_cost_metrics_families_exposed(client):
+    text = client.get("/metrics").text
+    for metric in (
+        "dsh_cost_usd_total",
+        "dsh_cache_savings_usd_total",
+        "dsh_cost_unknown_model_total",
+    ):
+        assert f"# TYPE {metric} counter" in text
+
+
+# --------------------------------------------------------------------------- #
+# Session result / effectiveness (stage 4)
+# --------------------------------------------------------------------------- #
+
+def _metric_value_for(client, metric: str, wanted: dict) -> float:
+    """Return the first sample value for ``metric`` whose labels match ``wanted``."""
+    for labels, value in _fetch_samples(client, metric):
+        if all(labels.get(k) == v for k, v in wanted.items()):
+            return value
+    return 0.0
+
+
+def test_terminal_record_emits_result_series(client):
+    """A session terminal event counts as outcome + work + quality (not usage)."""
+    session_id = _session()
+    # Includes outputTokens on purpose: a terminal record must NOT become usage.
+    record = _log_record(
+        session_id=session_id,
+        seq=1,
+        body={
+            "status": "completed",
+            "quality_estimate": 0.8,
+            "files_changed": 3,
+            "lines_added": 42,
+            "lines_deleted": 7,
+            "methods_added": 2,
+            "outputTokens": 5000,  # must be ignored: terminal records are not usage
+        },
+    )
+    record["timeUnixNano"] = _nanos(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    response = client.post("/v1/logs", json=_otlp_payload(record))
+    assert response.status_code == 200
+
+    base = {
+        "session_id": session_id,
+        "model": "deepseek-v4-flash",  # normalised tariff, joins with cost
+        "tool": "run",
+        "effort": "low",
+    }
+    outcome = dict(base, status="completed")
+    assert _metric_value_for(client, "dsh_session_outcome_total", outcome) == 1.0
+    assert _metric_value_for(client, "dsh_result_files_changed_total", base) == 3.0
+    assert _metric_value_for(client, "dsh_result_lines_added_total", base) == 42.0
+    assert _metric_value_for(client, "dsh_result_lines_deleted_total", base) == 7.0
+    assert _metric_value_for(client, "dsh_result_methods_added_total", base) == 2.0
+    assert _metric_value_for(client, "dsh_result_quality", base) == 0.8
+
+    # Terminal record is NOT usage -> no token series for this session.
+    assert _metric_value_for(
+        client, "dsh_tokens_total", {"type": "output", "session_id": session_id}
+    ) == 0.0
+
+
+def test_usage_without_status_creates_no_result_series(client):
+    """A plain usage record (no status) must not mint any result series."""
+    session_id = _session()
+    record = _log_record(
+        session_id=session_id,
+        seq=1,
+        body={"uncachedInputTokens": 100, "outputTokens": 50},
+    )
+    record["timeUnixNano"] = _nanos(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    assert client.post("/v1/logs", json=_otlp_payload(record)).status_code == 200
+
+    base = {"session_id": session_id, "model": "deepseek-v4-flash", "tool": "run", "effort": "low"}
+    assert _metric_value_for(
+        client, "dsh_session_outcome_total", dict(base, status="completed")
+    ) == 0.0
+    assert _metric_value_for(client, "dsh_result_files_changed_total", base) == 0.0
+    assert _metric_value_for(client, "dsh_result_quality", base) == 0.0

@@ -23,11 +23,12 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Request, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger("transformer")
@@ -35,6 +36,57 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+# --------------------------------------------------------------------------- #
+# Pricing (edge cost) support
+# --------------------------------------------------------------------------- #
+
+try:
+    import pricing as _pricing
+except ImportError:  # repo layout (tests): transformer is a plain dir on sys.path
+    from transformer import pricing as _pricing  # type: ignore[no-redef]
+
+# Env var pointing at the pricing table; the Docker image defaults to /app.
+_PRICING_FILE_ENV = "PRICING_FILE"
+_DEFAULT_PRICING_FILE = "/app/pricing.json"
+
+# Maps an existing `dsh_tokens_total` token-type label onto the billing slot used
+# to select a price row. ``decode`` is intentionally absent: it is not billed (its
+# relationship to output/reasoning tokens is unconfirmed).
+_COST_SLOTS = {
+    "input": "input_miss",
+    "cache_read": "input_hit",
+    "cache_write": "input_write",
+    "output": "output",
+}
+
+
+def _empty_pricing() -> dict:
+    """Minimal table used when the pricing file is absent/invalid.
+
+    Keeps the pipeline running with every cost at zero, per stage-1 rules.
+    """
+    return {
+        "pricing_version": "",
+        "default_effort": "low",
+        "peak_windows_utc": [(1, 4), (6, 10)],
+        "peak_weekdays": [1, 2, 3, 4, 5],
+        "route_map": {},
+        "rows": [],
+    }
+
+
+def _load_pricing_table() -> dict:
+    """Load the pricing table from ``PRICING_FILE``, degrading to empty on error."""
+    path = os.environ.get(_PRICING_FILE_ENV, _DEFAULT_PRICING_FILE)
+    try:
+        return _pricing.load_pricing(path)
+    except _pricing.PricingError as exc:
+        logger.warning(
+            "pricing table %s unavailable (%s); running unbilled", path, exc
+        )
+        return _empty_pricing()
+
 
 # DSH records these usage fields (in log `body`/`attributes` as JSON). The keys
 # are matched case-sensitively on the *leaf* name so nesting depth does not
@@ -84,6 +136,102 @@ class _UsageObservation:
     session_id: str
     model: str
     tool: str
+
+
+# --------------------------------------------------------------------------- #
+# Result-of-work contract (vision §2.3, fixed on stages 0/1)
+# --------------------------------------------------------------------------- #
+
+# A record is the *terminal* (result) record of a session when a ``status`` leaf
+# carries one of these values. Terminal records are routed to the result counters
+# instead of the token/cost path so they never double-count usage.
+_RESULT_STATUSES = frozenset({"completed", "failed", "error"})
+
+# Result fields (int work counters) we promote to Prometheus counters. Fields with
+# a list / low-information value (methods_modified, artifacts_created) are not
+# counted (see stage-4 notes).
+_RESULT_COUNT_FIELDS = ("files_changed", "lines_added", "lines_deleted", "methods_added")
+
+# Leaf name carrying the optional 0..1 quality estimate.
+_RESULT_QUALITY_FIELD = "quality_estimate"
+
+# Result work counters (labelled like outcome, without `status`).
+_RESULT_COUNTER_SPECS = {
+    "files_changed": ("dsh_result_files_changed_total", "Files changed by completed/failed DSH sessions."),
+    "lines_added": ("dsh_result_lines_added_total", "Lines added by DSH sessions."),
+    "lines_deleted": ("dsh_result_lines_deleted_total", "Lines deleted by DSH sessions."),
+    "methods_added": ("dsh_result_methods_added_total", "Methods added by DSH sessions."),
+}
+
+
+@dataclass(frozen=True)
+class _ResultObservation:
+    """Parsed terminal record: how a session finished and how much it produced."""
+
+    status: str
+    session_id: str
+    model: str
+    tool: str
+    effort: str
+    counters: Mapping[str, float]  # field -> positive value (files_changed, ...)
+    quality: Optional[float]  # 0..1 when the record carried quality_estimate
+
+
+def _record_leaves(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge ``body`` and ``attributes`` into one dotted-path -> scalar map."""
+    leaves: dict[str, Any] = {}
+    for source in (record.get("body"), record.get("attributes")):
+        if source is None:
+            continue
+        for key, val in _iter_leaves(source):
+            leaves.setdefault(key, val)
+    return leaves
+
+
+def extract_result(
+    record: Mapping[str, Any],
+    route_map: Mapping[str, str],
+    default_effort: str,
+) -> Optional[_ResultObservation]:
+    """Return a result observation when ``record`` is a session terminal event.
+
+    A record is terminal only when a ``status`` leaf has a value from
+    ``_RESULT_STATUSES``. Otherwise ``None`` is returned and the caller processes
+    the record as ordinary usage. ``model`` is the normalised pricing model so
+    result counters join cleanly with ``dsh_cost_usd_total``.
+    """
+    leaves = _record_leaves(record)
+    status_raw = _find_leaf(leaves, "status")
+    if status_raw is None:
+        return None
+    status = str(status_raw).strip().lower()
+    if status not in _RESULT_STATUSES:
+        return None
+
+    route = _resolve(leaves, _ATTR_MODEL, "unknown")
+    model = _pricing.normalize_model(route, route_map) or "unknown"
+    effort = _pricing.effort_for(leaves, default_effort)
+
+    counters: dict[str, float] = {}
+    for field in _RESULT_COUNT_FIELDS:
+        value = _find_leaf(leaves, field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            counters[field] = float(value)
+
+    quality: Optional[float] = None
+    quality_raw = _find_leaf(leaves, _RESULT_QUALITY_FIELD)
+    if isinstance(quality_raw, (int, float)) and not isinstance(quality_raw, bool):
+        quality = float(quality_raw)
+
+    return _ResultObservation(
+        status=status,
+        session_id=_resolve(leaves, _ATTR_SESSION, "unknown"),
+        model=model,
+        tool=_resolve(leaves, _ATTR_TOOL, "unknown"),
+        effort=effort,
+        counters=counters,
+        quality=quality,
+    )
 
 
 def _join_path(prefix: str, key: str) -> str:
@@ -197,6 +345,22 @@ def _find_leaf(leaves: Mapping[str, Any], field: str) -> Any:
         if _leaf(key) == field:
             return val
     return None
+
+
+def _record_utc_dt(record: Mapping[str, Any]) -> datetime:
+    """Return an aware-UTC datetime for a record's ``timeUnixNano`` (else now).
+
+    OTLP proto-JSON often serialises the int64 ``timeUnixNano`` as a decimal
+    string, so both int and numeric-string forms are accepted.
+    """
+    raw = record.get("timeUnixNano")
+    try:
+        ns = int(raw)
+    except (TypeError, ValueError):
+        ns = None
+    if ns is not None:
+        return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+    return datetime.now(tz=timezone.utc)
 
 
 def extract_tokens_and_labels(record: Mapping[str, Any]) -> list[_UsageObservation]:
@@ -316,15 +480,55 @@ class _MetricsStore:
             "dsh_log_records_dropped_total",
             "Log records skipped as duplicates or parse failures.",
         )
+        self.cost_usd_total = Counter(
+            "dsh_cost_usd_total",
+            "Estimated total USD spend, billed at the edge on ingest.",
+            ("type", "session_id", "model", "tool", "effort", "period", "price_version"),
+        )
+        self.cache_savings_usd_total = Counter(
+            "dsh_cache_savings_usd_total",
+            "Estimated USD saved by prompt-cache hits vs cache-miss pricing.",
+            ("session_id", "model", "tool", "effort", "period", "price_version"),
+        )
+        self.cost_unknown_model_total = Counter(
+            "dsh_cost_unknown_model_total",
+            "Ingest attempts for model routes with no matching pricing row (unbilled).",
+        )
+        self.session_outcome_total = Counter(
+            "dsh_session_outcome_total",
+            "Session terminal events (completed/failed/error), by outcome.",
+            ("status", "session_id", "model", "tool", "effort"),
+        )
+        self._result_counters: dict[str, Counter] = {}
+        for field, (metric_name, help_text) in _RESULT_COUNTER_SPECS.items():
+            self._result_counters[field] = Counter(
+                metric_name,
+                help_text,
+                ("session_id", "model", "tool", "effort"),
+            )
+        self.result_quality = Gauge(
+            "dsh_result_quality",
+            "Quality estimate (0..1) for a session terminal event.",
+            ("session_id", "model", "tool", "effort"),
+        )
+        self.pricing = _load_pricing_table()
 
     def consume(self, document: Mapping[str, Any]) -> int:
         """Extract and count all observations in one OTLP logs document."""
         counted = 0
+        cfg = self.pricing
         for record in _iter_records(document):
             self.records_received.inc()
             if not self._deduplicator.is_new(record):
                 self.records_dropped.inc()
                 continue
+            # A session terminal event is counted as a result and is NOT usage:
+            # it never produces token/cost series.
+            result = extract_result(record, cfg["route_map"], cfg["default_effort"])
+            if result is not None:
+                self._count_result(result)
+                continue
+            self._count_cost(record)
             for obs in extract_tokens_and_labels(record):
                 self.tokens_total.labels(
                     type=obs.token_type,
@@ -334,6 +538,99 @@ class _MetricsStore:
                 ).inc(obs.value)
                 counted += 1
         return counted
+
+    def _count_result(self, result: _ResultObservation) -> None:
+        """Emit outcome / work / quality series for one session terminal event."""
+        base_labels = {
+            "session_id": result.session_id,
+            "model": result.model,
+            "tool": result.tool,
+            "effort": result.effort,
+        }
+        self.session_outcome_total.labels(status=result.status, **base_labels).inc()
+        for field, counter in self._result_counters.items():
+            value = result.counters.get(field)
+            if value is not None and value > 0:
+                counter.labels(**base_labels).inc(value)
+        if result.quality is not None:
+            self.result_quality.labels(**base_labels).set(result.quality)
+
+    def _count_cost(self, record: Mapping[str, Any]) -> None:
+        """Add cost/savings for one de-duplicated usage record.
+
+        Model routes that do not resolve via ``route_map`` are unbilled and bump
+        the label-less unknown counter. A record with no active price row for a
+        slot is likewise unbilled (cost stays 0) but never raises.
+        """
+        cfg = self.pricing
+        observations = extract_tokens_and_labels(record)
+        if not observations:
+            return
+
+        model = _pricing.normalize_model(observations[0].model, cfg["route_map"])
+        if model is None:
+            self.cost_unknown_model_total.inc()
+            return
+
+        # Leaves (body + attributes merged) are needed only to honour an
+        # optional `effort`/`reasoningEffort` override on the record.
+        leaves: dict[str, Any] = {}
+        for source in (record.get("body"), record.get("attributes")):
+            if source is None:
+                continue
+            for key, val in _iter_leaves(source):
+                leaves.setdefault(key, val)
+
+        ts = _record_utc_dt(record)
+        session_id = observations[0].session_id
+        tool = observations[0].tool
+        effort = _pricing.effort_for(leaves, cfg["default_effort"])
+        period = _pricing.period_for(
+            ts, cfg["peak_windows_utc"], cfg["peak_weekdays"]
+        )
+
+        # Aggregate token values per billing slot (decode excluded by _COST_SLOTS).
+        slot_tokens: dict[str, float] = {}
+        for obs in observations:
+            slot = _COST_SLOTS.get(obs.token_type)
+            if slot is not None:
+                slot_tokens[slot] = slot_tokens.get(slot, 0.0) + obs.value
+
+        for slot, tokens in slot_tokens.items():
+            if tokens <= 0:
+                continue
+            priced = _pricing.price_for(model, slot, period, ts, cfg["rows"])
+            if priced is None:
+                continue
+            usd_per_1m, version = priced
+            cost_usd = (tokens / 1_000_000.0) * usd_per_1m
+            if cost_usd > 0:
+                self.cost_usd_total.labels(
+                    type=slot,
+                    session_id=session_id,
+                    model=model,
+                    tool=tool,
+                    effort=effort,
+                    period=period,
+                    price_version=version,
+                ).inc(cost_usd)
+
+        # Cache savings = cache-hit tokens × (miss − hit price) for same model.
+        hit_tokens = slot_tokens.get("input_hit", 0.0)
+        if hit_tokens > 0:
+            miss = _pricing.price_for(model, "input_miss", period, ts, cfg["rows"])
+            hit = _pricing.price_for(model, "input_hit", period, ts, cfg["rows"])
+            if miss and hit and miss[1] == hit[1]:
+                usd = (hit_tokens / 1_000_000.0) * (miss[0] - hit[0])
+                if usd > 0:
+                    self.cache_savings_usd_total.labels(
+                        session_id=session_id,
+                        model=model,
+                        tool=tool,
+                        effort=effort,
+                        period=period,
+                        price_version=miss[1],
+                    ).inc(usd)
 
     def render(self) -> bytes:
         return generate_latest()
