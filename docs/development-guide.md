@@ -1,103 +1,68 @@
 # Development Guide — DSH Telemetry Export
 
 ## 1. Local environment
-
-- Python 3.11+ (the transformer image uses `python:3.11-slim`)
-- Docker Engine 20.10+ and Docker Compose v2
-- Git
+- Python 3.11+ (image uses `python:3.11-slim`), Docker Engine 20.10+ / Compose v2.
 
 ## 2. Project layout
-
 ```
-docker-compose.yml                       # orchestration
-configs/otel.yaml                        # collector config
-configs/prometheus.yml                   # scrape config
-configs/grafana/{datasources,dashboards}/ # Grafana provisioning
-transformer/Dockerfile                   # image build
-transformer/app.py                       # FastAPI log→metric transformer
-transformer/requirements.txt             # pinned runtime deps
-transformer/requirements-dev.txt         # pinned test deps
-tests/                                   # pytest suite
-docs/                                    # this documentation set
+docker-compose.yml                        # orchestration (5 services)
+configs/
+  otel.yaml                               # collector: OTLP → transformer + Loki
+  pricing.json                            # versioned pricing table + route_map
+  loki.yaml                               # single-binary Loki config
+  prometheus.yml / prometheus-alerts.yml  # scrape + alert rules
+  grafana/{datasources,dashboards}/       # provisioning + 4 dashboards
+transformer/
+  Dockerfile, app.py, pricing.py
+  requirements.txt, requirements-dev.txt
+tests/                                    # test_app.py, test_pricing.py
+docs/                                     # architecture, SRS, spec, runbook, dev guide
 ```
 
-The transformer is a single FastAPI application. Key functions in
-`transformer/app.py`:
+## 3. Key code in `transformer/`
+- `app.py` — FastAPI app; `_MetricsStore` registers token/cost/result metrics;
+  `consume()` routes each record: terminal event (leaf `status`) → result; else
+  → cost + tokens. Endpoints `/`, `/healthz`, `/v1/logs`, `/metrics`.
+- `pricing.py` — pure functions: `normalize_model`, `classify_unknown`,
+  `effort_for`, `period_for` (peak/off-peak by timestamp), `price_for`,
+  `load_pricing`. No Prometheus/IO coupling.
+- Wire parsing is in `app.py` (`_iter_leaves`, `_unwrap_any_value`): handles OTLP
+  proto-JSON `AnyValue`, `repeated KeyValue` attributes, JSON-string bodies and
+  plain maps; fields matched by leaf name.
 
-- `_iter_leaves` / `_unwrap_any_value` — walk OTLP proto-JSON
-  (`AnyValue` wrappers, `repeated KeyValue` attributes, JSON-string bodies).
-- `extract_tokens_and_labels(record)` — pure function returning numeric usage
-  observations with resolved labels.
-- `_BoundedDeduplicator` — LRU that drops replayed `(session.id, event.seq)`.
-- Endpoints: `POST /v1/logs`, `GET /metrics`, `GET /healthz`, `GET /`.
-
-## 3. Setting up for development
-
+## 4. Setup
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r transformer/requirements-dev.txt
+.venv/bin/pip install -r transformer/requirements-dev.txt   # runtime + pytest + httpx
 ```
 
-The dev requirements file includes the pinned runtime deps plus `pytest` and
-`httpx`.
-
-## 4. Testing
-
+## 5. Tests
 ```bash
 .venv/bin/python -m pytest tests/
 ```
+Covers: token/result extraction (flat, nested, proto-JSON), label resolution and
+fallbacks, zero/negative handling, de-duplication, pricing (slots, peak/off-peak,
+effective_from, model mapping, `decode` not billed), cost/savings example values,
+API behaviour (400/415/healthz/metrics), per-session isolation.
 
-The suite covers field extraction (flat, nested, proto-JSON `AnyValue` and
-`repeated KeyValue` attributes), label resolution and fallbacks, zero/negative
-value handling, de-duplication, the `POST /v1/logs` / `GET /metrics` /
-`GET /healthz` endpoints, and error handling (malformed JSON → 400, non-JSON
-content-type → 415).
-
-## 5. Running the transformer standalone
-
+## 6. Running standalone
 ```bash
-.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000   # from transformer/
-# or
 cd transformer && ../.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+# POST an OTLP/HTTP JSON document to /v1/logs; inspect /metrics
 ```
+`PRICING_FILE` defaults to `/app/pricing.json`; set it when running outside the
+container.
 
-Send a sample OTLP/HTTP JSON document (proto-JSON shape):
-
+## 7. Building / running the stack
 ```bash
-curl -X POST http://localhost:8000/v1/logs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "resourceLogs": [{
-      "scopeLogs": [{
-        "logRecords": [{
-          "body": {"stringValue": "{\"uncachedInputTokens\":10,\"outputTokens\":7}"},
-          "attributes": [
-            {"key": "session.id", "value": {"stringValue": "test"}},
-            {"key": "event.seq",  "value": {"intValue": "1"}},
-            {"key": "model",      "value": {"stringValue": "deepseek-chat"}},
-            {"key": "tool",       "value": {"stringValue": "coding"}}
-          ]
-        }]
-      }]
-    }]
-  }'
-curl http://localhost:8000/metrics | grep ^dsh_tokens_total
-```
-
-## 6. Building the image
-
-```bash
-docker compose build transformer     # or: docker compose up -d --build
+docker compose build transformer      # or: docker compose up -d --build
 docker compose up -d
 ```
 
-The Docker image runs as the non-root user `appuser` and exposes a
-`HEALTHCHECK` on `GET /healthz`.
-
-## 7. Contributing
-
-- Open a pull request against `main`.
-- Keep changes scoped: if behaviour (ports/topology/metric labels) changes,
-  update `docker-compose.yml`, `configs/*` and the docs together.
-- Run `python -m pytest tests/` before finishing.
-- Use clear commit messages and PEP 8, typed Python.
+## 8. Contributing
+- Keep changes scoped: if behaviour (ports/topology/metric labels/pricing)
+  changes, update `docker-compose.yml`, `configs/*` and `docs/*` together.
+- Add tests in `tests/` mirroring existing patterns; run `python -m pytest`.
+- Keep `pricing.py` pure and `app.py` thin; PEP 8, typed.
+- One USD source of truth: change cost only through `configs/pricing.json` +
+  `pricing.py` logic, never a second parallel engine.

@@ -9,6 +9,11 @@ global:
   external_labels:
     source: dsh-local
 
+# Cost/high-session/unknown-model alerts (see prometheus-alerts.yml). No external
+# notifier is configured; rules are inspected via /api/v1/rules.
+rule_files:
+  - /etc/prometheus/prometheus-alerts.yml
+
 scrape_configs:
   - job_name: "transformer"
     metrics_path: /metrics

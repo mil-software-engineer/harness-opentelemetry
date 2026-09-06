@@ -37,6 +37,22 @@ exporters:
       enabled: true
       max_elapsed_time: 60s
 
+  # Duplicates the same OTLP log stream into the local Loki instance so session
+  # context / raw log bodies can be queried from Grafana alongside the metrics.
+  # Runs in parallel to the transformer exporter (not in place of it).
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    encoding: json
+    compression: gzip
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 512
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 60s
+
   # Optional quick-local-inspection sink; remove from the pipeline to silence.
   debug:
     verbosity: basic
@@ -51,4 +67,4 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp_http/transformer, debug]
+      exporters: [otlp_http/transformer, otlp_http/loki, debug]

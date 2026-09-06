@@ -3,11 +3,11 @@
 ## 1. Context
 
 End-to-end pipeline that exports DeepSeek Harness (DSH) session telemetry to a
-**local** observability stack (Grafana + Prometheus) so token usage can be
-analysed by token type, session, model and tool, and over time. All traffic is
-confined to the host; no external SaaS is used.
+**local** stack (Prometheus + Loki + Grafana) so token usage, USD cost, cache
+effectiveness and session **results** can be analysed by type, session, model,
+tool and effort, and over time. All traffic is confined to the host.
 
-## 2. High-Level Architecture
+## 2. High-level architecture
 
 ### 2.1 Data flow
 
@@ -15,75 +15,80 @@ confined to the host; no external SaaS is used.
 flowchart LR
     DSH[DSH Server] -- "OTLP/HTTP logs (protobuf) :4318" --> CO[otel-collector]
     CO -- "OTLP/HTTP JSON :8000/v1/logs" --> TR[transformer]
-    TR -- "/metrics scrape" --> PRO[Prometheus :9090]
-    PRO -- "PromQL" --> GRAF[Grafana :3000]
+    CO -- "OTLP/HTTP JSON :3100/otlp" --> LK[loki]
+    TR -- "/metrics scrape" --> PRO[prometheus :9090]
+    PRO -- "PromQL" --> GRAF[grafana :3000]
+    LK -- "LogQL" --> GRAF
 ```
 
-1. DSH pushes OTLP/HTTP **logs** (protobuf) to the collector on host port `4318`.
-2. The collector batches them (`memory_limiter` + `batch`) and forwards them to
-   the transformer over HTTP with `encoding: json`.
-3. The transformer parses each log record, extracts numeric usage fields and
-   increments the `dsh_tokens_total` counter (labels: `type`, `session_id`,
-   `model`, `tool`).
-4. Prometheus scrapes `transformer:8000/metrics` every 10s.
-5. Grafana queries Prometheus and renders the auto-provisioned dashboard.
+1. DSH pushes OTLP/HTTP **logs** (protobuf) to the collector on host `4318`.
+2. The collector batches (`memory_limiter` + `batch`) and re-exports the stream
+   twice in parallel: as OTLP/HTTP **JSON** to the transformer, and to Loki.
+3. The transformer parses each record and produces metrics: tokens,
+   **edge-computed USD cost** (versioned pricing) and **session results** from a
+   terminal event. It exposes `/metrics` and `/healthz`.
+4. Prometheus scrapes `transformer:8000` every 10s and evaluates alert rules.
+5. Loki stores the raw log stream; Grafana queries Prometheus (metrics) and Loki
+   (raw logs / session context).
 
 ### 2.2 Component responsibilities
 
-| Component        | Responsibility                                                             |
-|------------------|----------------------------------------------------------------------------|
-| otel-collector   | Receive OTLP/HTTP logs on `4318`, batch, forward as OTLP/HTTP JSON to the transformer. No log→metric conversion. |
-| transformer      | Parse log records (OTLP proto-JSON: `AnyValue` + `repeated KeyValue`), de-duplicate, maintain the `dsh_tokens_total` counter, expose `/metrics` and `/healthz`. |
-| prometheus       | Scrape the transformer every 10s, store time-series, serve PromQL.         |
-| grafana          | Pre-provisioned Prometheus data source + imported **DSH Token Usage** dashboard. |
+| Component       | Responsibility |
+|-----------------|----------------|
+| otel-collector  | Receive OTLP/HTTP logs on `4318`; batch; re-export JSON to transformer and Loki. No log→metric conversion. |
+| transformer     | Only component with logic. De-duplicate on `(session.id, event.seq)`; emit token/cost/result metrics; resolve model route→tariff, effort, peak/off-peak at the edge. |
+| prometheus      | Scrape the transformer every 10s; store time-series; evaluate alert rules. |
+| loki            | Single-binary log store keeping the raw DSH log stream for session context. |
+| grafana         | Pre-provisioned Prometheus + Loki sources; auto-imports four dashboards. |
 
 ## 3. Design decisions
 
-### 3.1 Why an intermediary transformer?
+### 3.1 Why an intermediary transformer
+DSH emits OTLP *logs*, never metric series, and the collector cannot turn log
+bodies into Prometheus counters. A small single-purpose FastAPI service is the
+log→metric generator: the collector's export target and Prometheus' scrape
+target. It owns all business logic and is kept simple.
 
-DSH emits OTLP *logs*, never metric series, and the OTel Collector has no
-built-in "log record → Prometheus counter" transform. A small single-purpose
-FastAPI service is therefore the log→metric generator: the collector's export
-target and Prometheus' scrape target. It is the only component with business
-logic and is deliberately kept simple.
-
-### 3.2 Collector → transformer transport
-
-The collector is configured with an `otlp_http/transformer` exporter that uses
-`encoding: json` (base endpoint `http://transformer:8000`; the exporter appends
-`/v1/logs`). JSON is required because the transformer is a JSON endpoint, not a
-protobuf one.
+### 3.2 Collector → downstream transport
+The collector's `otlp_http/transformer` exporter uses `encoding: json` (the
+transformer is a JSON endpoint, not protobuf) at base `http://transformer:8000`
+(the exporter appends `/v1/logs`). A parallel `otlp_http/loki` exporter
+(`http://loki:3100/otlp`, gzip) duplicates the stream to Loki.
 
 ### 3.3 De-duplication
+A **bounded** LRU keyed by `(session.id, event.seq)` prevents double counting on
+retries (`DSH_DEDUP_CAPACITY`, default 100 000). Records without a stable
+identity are always counted.
 
-The transformer keeps a **bounded** LRU of seen records keyed by
-`(session.id, event.seq)` so a replayed/retried delivery is not double-counted.
-Capacity is bounded (default 100 000, `DSH_DEDUP_CAPACITY`) to avoid an
-unbounded memory leak. Records without a stable identity are always counted.
+### 3.4 Cost at the edge
+USD cost is computed on ingest (`transformer/pricing.py`) from a versioned table
+(`configs/pricing.json`). Model **routes** (`deepseek-chat`/`deepseek-reasoner`)
+are normalised to **tariff** names (`deepseek-v4-flash`/`-pro`); peak/off-peak is
+decided by record timestamp (UTC); a price row is active once
+`effective_from <= record_time`. `decodeTokens` is counted as a token but
+deliberately **not billed** (its relation to `output`/reasoning is unconfirmed).
+This is the single USD source of truth.
 
-### 3.4 Label design
+### 3.5 Result contract
+A session **terminal event** carries a JSON body with `status`
+(completed/failed/error) plus optional `quality_estimate`, `files_changed`,
+`lines_added`, `lines_deleted`, `methods_added`. Such records are counted as
+results (outcome / work counters + quality gauge) and never as token/cost usage.
 
-`dsh_tokens_total` is labelled by `type`, `session_id`, `model`, `tool`. A
-per-record `day` label is intentionally **not** emitted: bucketing by day is
-left to PromQL (e.g. `increase(dsh_tokens_total[1d])`), which keeps the
-counter's label cardinality from growing with time.
+### 3.6 Cardinality and model-label semantics
+`task_type`, `experiment`, `user_id` live in Loki / sparse counters, not on every
+Prometheus counter. On `dsh_tokens_total`, `model` is the telemetry **route**;
+on cost/result counters it is the normalised **tariff** — join across them via
+`route_map` in `configs/pricing.json` when needed.
 
-### 3.5 Graceful robustness
+### 3.7 Wire robustness
+The transformer tolerates the collector's JSON: `body` as an OTLP `AnyValue`
+(including a JSON-string payload) and `attributes` as OTel `repeated KeyValue`
+arrays, as well as plain maps. Token/result fields are matched by **leaf key
+name**, flat or nested.
 
-The transformer tolerates the wire formats the collector actually produces —
-`body` as an OTLP `AnyValue` (including a JSON-string payload) and `attributes`
-as OTel `repeated KeyValue` arrays — and also plain maps. Token fields are
-matched by leaf key name, so they are found whether recorded flat or nested.
-
-## 4. Scalability assumptions
-
-- For the intended scale (tens to hundreds of records/sec) no tuning is needed.
-- For much higher volumes, scale the transformer horizontally (multi-worker /
-  multiple replicas) or move token derivation closer to DSH.
-
-## 5. Future extensions
-
-- Optional redaction rules for `FULL` payloads.
-- Alerting (Alertmanager) on token spend / error severity.
-- A separate logs sink (e.g. Loki) if log retention is required in addition to
-  the derived Prometheus metrics.
+## 4. Notes
+- One USD source of truth (the transformer); third-party plugins (`dsh-analytics`,
+  `dsh-plugin-otel-genai`) are not wired in (deferred/skipped after review).
+- Everything is local; no external SaaS.
+- Alerts are evaluated by Prometheus locally (no external notifier/Alertmanager).
